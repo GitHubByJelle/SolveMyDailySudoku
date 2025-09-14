@@ -4,7 +4,7 @@ from sudoku.utils import logger
 
 if __name__ == "__main__":
     # Extract
-    scraper: SudokoScraper = SudokoScraper()
+    scraper: SudokoScraper = SudokoScraper(headless=False)
     info: SudokuInfo = scraper.fetch_daily()
 
     # Solve
@@ -25,6 +25,5 @@ if __name__ == "__main__":
 
     assert solution == info.solution, "The solution found, and received are not similar"
 
-    logger.info(f"Solved Board:\n{solver.s.to_board_string()}")
-    logger.info(f"Solution string: {solution}")
+    scraper.fill_in_answer(solution=solution, keep_open=True)
 
