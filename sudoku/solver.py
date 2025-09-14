@@ -2,15 +2,18 @@ from collections import deque
 from typing import Tuple, List
 
 from .state import SudokuState
-from .utils import num_ones
+from .utils import num_ones, logger
+
 
 class SudokuSolver:
     def __init__(self, state: SudokuState):
         self.s = state
         self.units = self._units()
+        logger.info("SudokuSolver ready (n=%d, box=%d)", self.s.n, self.s.box)
 
     @classmethod
     def from_string(cls, mission: str) -> "SudokuSolver":
+        logger.info("Init from mission string (len=%d)", len(mission))
         return cls(SudokuState.from_string(mission))
 
     # ------ Helpers ------
@@ -21,13 +24,12 @@ class SudokuSolver:
         for j in self.s.neigh[idx]:
             ban |= self.s.board[j]
         return self.s.all_mask & ~ban
-    
+
     def _assign_and_enqueue(self, idx: int, mask: int, q: deque) -> None:
         self.s.assign(idx, mask)
         for j in self.s.neigh[idx]:
-            if self.s.board[j] == 0:
-                if j not in q:
-                    q.append(j)
+            if self.s.board[j] == 0 and j not in q:
+                q.append(j)
 
     def _units(self) -> Tuple[List[List[int]], List[List[int]], List[List[int]]]:
         n, box = self.s.n, self.s.box
@@ -49,10 +51,12 @@ class SudokuSolver:
         Do ONE pass of deduction.
         Returns (changed, contradiction_found).
         Applies: neighbor elimination, naked singles, hidden singles (once).
-        Naked Single: Only has one option
-        Hidden Single: In a given unit (one row, one column, or one box), if a digit can go in exactly one cell, that cell must take that digit
         """
-        changed = False
+        # counters for one clean summary at the end
+        opts_updates = 0
+        naked_singles = 0
+        hidden_singles = 0
+
         rows, cols, boxes = self.units
         q = deque()
 
@@ -63,32 +67,37 @@ class SudokuSolver:
                     if self.s.board[j] == 0:
                         q.append(j)
 
-        # helper: tighten options from queue; assign naked singles
+        changed = False
+
         def tighten_from_queue() -> Tuple[bool, bool]:
-            nonlocal changed
+            nonlocal changed, opts_updates, naked_singles
             while q:
                 j = q.popleft()
                 if self.s.board[j] != 0:
                     continue
                 new_mask = self._allowed_mask(j)
                 if new_mask == 0:
+                    logger.warning("Contradiction (no candidates) at cell %d", j)
                     return changed, True
                 if new_mask != self.s.opts[j]:
                     self.s.opts[j] = new_mask
+                    opts_updates += 1
                     changed = True
                 if num_ones(new_mask) == 1:
                     self._assign_and_enqueue(j, new_mask, q)
+                    naked_singles += 1
                     changed = True
             return changed, False
 
         # 1) neighbor eliminations + naked singles
         ch, bad = tighten_from_queue()
         if bad:
+            logger.info("Deduction: contradiction during neighbor/naked stage "
+                        "(updates=%d, naked=%d)", opts_updates, naked_singles)
             return ch, True
-        
-        # 2) hidden singles (may enqueue and then tighten once more)
+
+        # 2) hidden singles
         for unit in (*rows, *cols, *boxes):
-            # bit -> candidate indices
             pos = {}
             for idx in unit:
                 if self.s.board[idx] == 0:
@@ -104,14 +113,19 @@ class SudokuSolver:
                     idx = where[0]
                     if self.s.board[idx] == 0:
                         self._assign_and_enqueue(idx, bit, q)
+                        hidden_singles += 1
                         changed = True
 
-            # Process consequences of any hidden-single assignments done in this unit
             if q:
                 ch, bad = tighten_from_queue()
                 if bad:
+                    logger.info("Deduction: contradiction after hidden singles "
+                                "(updates=%d, naked=%d, hidden=%d)",
+                                opts_updates, naked_singles, hidden_singles)
                     return ch, True
 
+        logger.info("Deduction: changed=%s (updates=%d, naked=%d, hidden=%d)",
+                    changed, opts_updates, naked_singles, hidden_singles)
         return changed, False
 
     def _deduce_until_stable(self) -> Tuple[bool, bool]:
@@ -120,11 +134,15 @@ class SudokuSolver:
         Returns (progress_made, contradiction_found).
         """
         any_change = False
+        rounds = 0
         while True:
+            rounds += 1
             changed, bad = self._deduce()
             if bad:
+                logger.info("Fixpoint: halted by contradiction after %d round(s)", rounds)
                 return any_change or changed, True
             if not changed:
+                logger.info("Fixpoint: reached after %d round(s), progress=%s", rounds, any_change)
                 return any_change, False
             any_change = True
 
@@ -132,8 +150,10 @@ class SudokuSolver:
         # run deduction first
         _, bad = self._deduce_until_stable()
         if bad:
+            logger.info("Search: aborted (contradiction after deduction)")
             return False
         if self.is_solved():
+            logger.info("Search: solved by deduction only")
             return True
 
         # choose cell with fewest options
@@ -144,8 +164,9 @@ class SudokuSolver:
                 c = num_ones(m)
                 if c < best_count:
                     best_idx, best_mask, best_count = i, m, c
-                    if c == 2:  # good heuristic: break early on 2
+                    if c == 2:  # good heuristic
                         break
+        logger.info("Search: branching on cell %d (%d options)", best_idx, best_count)
 
         # try each option (clone state for branch)
         b = best_mask
@@ -156,12 +177,13 @@ class SudokuSolver:
             SudokuSolver(branch).s.assign(best_idx, bit)  # seed assignment
             solver = SudokuSolver(branch)
             if solver._search():
-                # copy back winning board/opts
                 self.s.board = branch.board
                 self.s.opts = branch.opts
+                logger.info("Search: success")
                 return True
+        logger.info("Search: all branches failed at cell %d", best_idx)
         return False
-    
+
     # --- Convenience checks ---
     def is_solved(self) -> bool:
         s = self.s
@@ -177,6 +199,7 @@ class SudokuSolver:
                 seen |= m
             if seen != s.all_mask:
                 return False
+        logger.info("Solved: valid complete grid")
         return True
 
     # ----- Public ------
@@ -184,9 +207,12 @@ class SudokuSolver:
         _, bad = self._deduce_until_stable()
         if bad:
             raise ValueError("Contradiction during deduction.")
-        return self.is_solved()
-    
+        solved = self.is_solved()
+        logger.info("solve_deductive -> %s", solved)
+        return solved
+
     def solve_search(self) -> bool:
         """Optional: deduction + DFS search. Keeps `SudokuState` clean."""
         ok = self._search()
+        logger.info("solve_search -> %s", ok)
         return ok
